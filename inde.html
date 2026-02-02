@@ -27,7 +27,6 @@
     <div class="status" id="status">대기 중…</div>
 
     <video id="video" playsinline autoplay muted></video>
-    <canvas id="canvas" style="display:none;"></canvas>
   </div>
 
 <script>
@@ -75,28 +74,77 @@
   // 튜닝
   // =========================
   const SCAN_INTERVAL_MS = 140;
-  const RMSE_THRESHOLD = 80; // 필요 시 조절
+
+  // NOTE: 8x8 + affine fit 기준으로 80은 꽤 관대한 편.
+  // 오탐이 많으면 낮추고(예: 50~70), 인식이 안 되면 올리세요(예: 90~120).
+  const RMSE_THRESHOLD = 80;
+
   const DET_W = 480;
   const DET_H = 480;
+
   const WARP_SIZE = 300;
 
   // =========================
-  // 유틸: 패턴 검증 + 레벨 매핑 자동 선택
+  // DOM
   // =========================
-  function assertPattern8x8AndLevels(p) {
+  const statusEl = document.getElementById("status");
+  const video = document.getElementById("video");
+  const btnStart = document.getElementById("start");
+  const btnStop  = document.getElementById("stop");
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  // =========================
+  // 안전/호환: 캔버스 컨텍스트 폴백
+  // =========================
+  function get2DContextSafe(canvas) {
+    // Safari/일부 브라우저에서 willReadFrequently 옵션 때문에 null 반환되는 경우가 있어 폴백
+    return canvas.getContext("2d", { willReadFrequently: true }) || canvas.getContext("2d");
+  }
+
+  // 내부 캔버스들
+  const detCanvas = document.createElement("canvas");
+  detCanvas.width = DET_W; detCanvas.height = DET_H;
+  const detCtx = get2DContextSafe(detCanvas);
+
+  const warpCanvas = document.createElement("canvas");
+  warpCanvas.width = WARP_SIZE; warpCanvas.height = WARP_SIZE;
+  const warpCtx = get2DContextSafe(warpCanvas);
+
+  if (!detCtx || !warpCtx) {
+    setStatus("오류: 캔버스 2D 컨텍스트 생성 실패(브라우저 호환성). 다른 브라우저로 시도하세요.");
+    return;
+  }
+
+  // =========================
+  // 패턴 검증 + 레벨 매핑 자동 선택
+  // =========================
+  function validatePattern(p) {
     if (!Array.isArray(p.levels) || p.levels.length !== N) {
-      throw new Error(`Pattern "${p.id}" must be ${N}x${N}. got ${p.levels?.length}x${p.levels?.[0]?.length}`);
+      setStatus(`패턴 오류("${p.id}"): levels는 ${N}x${N}이어야 합니다.`);
+      console.error("Pattern size error:", p);
+      return false;
     }
     for (const row of p.levels) {
       if (!Array.isArray(row) || row.length !== N) {
-        throw new Error(`Pattern "${p.id}" must be ${N}x${N}. got ragged row`);
+        setStatus(`패턴 오류("${p.id}"): 행 길이가 ${N}이 아닙니다.`);
+        console.error("Pattern row error:", p);
+        return false;
       }
       for (const v of row) {
+        // 3레벨(0..2) 또는 4레벨(0..3)만 허용
         if (!Number.isFinite(v) || v < 0 || v > 3) {
-          throw new Error(`Pattern "${p.id}" has invalid level "${v}". allowed: 0..3`);
+          setStatus(`패턴 오류("${p.id}"): 레벨 값 ${v} (허용: 0..3).`);
+          console.error("Pattern level error:", p);
+          return false;
         }
       }
     }
+    return true;
+  }
+
+  for (const p of PATTERNS) {
+    if (!validatePattern(p)) return;
   }
 
   function maxLevelOf(levels2d) {
@@ -106,15 +154,13 @@
   }
 
   function levelToGrayForMax(maxLevel) {
-    // maxLevel=2 -> 3레벨(0,1,2)
-    // maxLevel=3 -> 4레벨(0,1,2,3)
+    // maxLevel=2 -> 3레벨: [0, mid, 255]
+    // maxLevel=3 -> 4레벨: [0, 85, 170, 255]
     if (maxLevel === 2) return [0, 127.5, 255];
     if (maxLevel === 3) return [0, 85, 170, 255];
-    throw new Error(`Unsupported maxLevel=${maxLevel}. levels는 0..2 또는 0..3만 허용`);
+    // 이 케이스는 사실상 패턴 검증에서 걸러져야 함
+    return null;
   }
-
-  // 패턴 검증(실수 방지)
-  for (const p of PATTERNS) assertPattern8x8AndLevels(p);
 
   // =========================
   // 회전/템플릿
@@ -130,6 +176,8 @@
     let k = 0;
     for (let r=0;r<N;r++) for (let c=0;c<N;c++) {
       const lv = levels2d[r][c];
+      // lv가 0..2인데 4레벨 매핑을 써도 문제는 없지만(인덱싱 가능),
+      // 여기서는 패턴별로 정확한 매핑을 선택했으니 그대로 사용
       v[k++] = levelToGray[lv];
     }
     return v;
@@ -137,12 +185,19 @@
 
   const ROT_PATTERNS = PATTERNS.map(p => {
     const r0 = p.levels;
-    const maxLv = maxLevelOf(r0);         // 2 or 3
-    const map = levelToGrayForMax(maxLv); // 3레벨/4레벨용 매핑 자동
+    const maxLv = maxLevelOf(r0);
+    const map = levelToGrayForMax(maxLv);
+
+    if (!map) {
+      setStatus(`패턴 오류("${p.id}"): maxLevel=${maxLv}는 지원하지 않습니다(0..2 또는 0..3만).`);
+      console.error("Unsupported max level:", p);
+      return null;
+    }
 
     const r1 = rotate90(r0);
     const r2 = rotate90(r1);
     const r3 = rotate90(r2);
+
     return {
       id: p.id,
       url: p.url,
@@ -150,36 +205,23 @@
         levelsToTargetVec(r0, map),
         levelsToTargetVec(r1, map),
         levelsToTargetVec(r2, map),
-        levelsToTargetVec(r3, map)
+        levelsToTargetVec(r3, map),
       ]
     };
-  });
+  }).filter(Boolean);
+
+  if (ROT_PATTERNS.length === 0) {
+    setStatus("오류: 유효한 패턴이 없습니다.");
+    return;
+  }
 
   // =========================
-  // DOM
+  // 상태
   // =========================
-  const statusEl = document.getElementById("status");
-  const video = document.getElementById("video");
-  const btnStart = document.getElementById("start");
-  const btnStop  = document.getElementById("stop");
-
-  video.style.objectFit = "cover";
-
-  // 내부 캔버스들
-  const detCanvas = document.createElement("canvas");
-  detCanvas.width = DET_W; detCanvas.height = DET_H;
-  const detCtx = detCanvas.getContext("2d", { willReadFrequently: true });
-
-  const warpCanvas = document.createElement("canvas");
-  warpCanvas.width = WARP_SIZE; warpCanvas.height = WARP_SIZE;
-  const warpCtx = warpCanvas.getContext("2d", { willReadFrequently: true });
-
   let stream = null;
   let timer = null;
   let opened = false;
   let okStreak = 0;
-
-  function setStatus(msg) { statusEl.textContent = msg; }
 
   // =========================
   // 기본 유틸
@@ -225,6 +267,7 @@
   // 사각형 4점 추정(간단)
   // =========================
   function estimateQuadFromEdges(mag, w, h) {
+    // 퍼센타일 임계값: 전체 sort (무겁지만 단순/확실). 필요하면 샘플링으로 바꿀 수 있음.
     const arr = Array.from(mag);
     arr.sort((a,b)=>a-b);
     const thr = arr[Math.floor(arr.length*0.92)] || 0; // 상위 8%
@@ -359,7 +402,7 @@
       }
     }
     warpCtx.putImageData(out, 0, 0);
-    return out; // ImageData
+    return out;
   }
 
   // =========================
@@ -382,6 +425,14 @@
       }
     }
 
+    // 안전: 값이 너무 적을 때(이론상 거의 없음) 처리
+    if (vals.length < 10) {
+      let sum = 0;
+      for (const v of vals) sum += v;
+      return vals.length ? (sum / vals.length) : 0;
+    }
+
+    // 트림 평균
     vals.sort((a,b)=>a-b);
     const cut = Math.floor(vals.length * 0.10);
     const slice = vals.slice(cut, vals.length - cut);
@@ -406,3 +457,156 @@
 
   function rmseWithAffineFit(obs, target) {
     const n = obs.length;
+    let meanO=0, meanT=0;
+    for (let i=0;i<n;i++) { meanO += obs[i]; meanT += target[i]; }
+    meanO/=n; meanT/=n;
+
+    let varO=0, cov=0;
+    for (let i=0;i<n;i++) {
+      const xo=obs[i]-meanO;
+      const yt=target[i]-meanT;
+      varO += xo*xo;
+      cov  += xo*yt;
+    }
+    if (varO < 1e-6) return Infinity;
+
+    const a = cov/varO;
+    if (a < 0) return Infinity;
+    const b = meanT - a*meanO;
+
+    let mse=0;
+    for (let i=0;i<n;i++) {
+      const diff = (a*obs[i] + b) - target[i];
+      mse += diff*diff;
+    }
+    return Math.sqrt(mse/n);
+  }
+
+  function passesContrastGate(obs) {
+    // 3레벨 패턴이 어두운 환경에서 미탐이 많으면 18 -> 14~16 정도로 낮춰보세요.
+    const n=obs.length;
+    let mean=0;
+    for (let i=0;i<n;i++) mean += obs[i];
+    mean/=n;
+    let v=0;
+    for (let i=0;i<n;i++) { const d=obs[i]-mean; v += d*d; }
+    v/=n;
+    return Math.sqrt(v) >= 18;
+  }
+
+  function scanFrameOnce() {
+    if (!captureToDetCanvas()) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
+
+    const img = detCtx.getImageData(0,0,DET_W,DET_H);
+    const gray = new Float32Array(DET_W*DET_H);
+    for (let i=0, p=0; i<img.data.length; i+=4, p++) {
+      gray[p] = rgbToGray(img.data[i], img.data[i+1], img.data[i+2]);
+    }
+
+    const mag = sobelEdges(gray, DET_W, DET_H);
+
+    const quad = estimateQuadFromEdges(mag, DET_W, DET_H);
+    if (!quad) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
+
+    const warped = warpFromDetCanvas(quad);
+    if (!warped) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
+
+    const obs = extractGrayVecFromWarp(warped);
+    if (!passesContrastGate(obs)) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
+
+    let best = Infinity, bestId=null, bestUrl=null;
+    for (const p of ROT_PATTERNS) {
+      for (const t of p.targets) {
+        const s = rmseWithAffineFit(obs, t);
+        if (s < best) { best = s; bestId=p.id; bestUrl=p.url; }
+      }
+    }
+    return { best, ok: best <= RMSE_THRESHOLD, bestId, bestUrl };
+  }
+
+  function loop() {
+    if (opened) return;
+
+    let res;
+    try {
+      res = scanFrameOnce();
+    } catch (e) {
+      // 어떤 이유로든 프레임 처리 중 예외가 나면 죽지 말고 상태 표시
+      console.error(e);
+      setStatus("스캔 처리 중 오류(콘솔 확인): " + (e?.message || e));
+      return;
+    }
+
+    if (res.ok) okStreak++;
+    else okStreak = Math.max(0, okStreak - 1);
+
+    setStatus(`스캔 중… score(RMSE)=${Number.isFinite(res.best)?res.best.toFixed(1):"inf"}, match=${res.bestId ?? "-"}, streak=${okStreak}`);
+
+    if (okStreak >= 3 && res.bestUrl) {
+      opened = true;
+      if (timer) { clearInterval(timer); timer = null; } // 성공 시 루프 정리
+      setStatus(`인식 성공(${res.bestId})! 이동합니다…`);
+      window.location.href = res.bestUrl;
+    }
+  }
+
+  async function startCamera() {
+    opened = false;
+    okStreak = 0;
+
+    // 중복 시작 방지
+    if (timer) { clearInterval(timer); timer = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+
+    setStatus("카메라 권한 요청 중…");
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+
+      video.srcObject = stream;
+
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+
+      // iOS/Safari 안정화: metadata+재생 보장
+      await new Promise(resolve => {
+        if (video.readyState >= 2) resolve();
+        else video.onloadedmetadata = () => resolve();
+      });
+
+      // 일부 브라우저는 사용자 제스처 후에도 play가 reject될 수 있어 try/catch
+      try { await video.play(); } catch (e) { /* 무시: autoplay 정책 */ }
+
+      setStatus("스캔 시작! (자동으로 사각형을 찾습니다)");
+      timer = setInterval(loop, SCAN_INTERVAL_MS);
+    } catch (err) {
+      console.error(err);
+      setStatus("카메라 시작 실패: " + (err?.name ? `${err.name} - ${err.message || ""}` : err));
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    }
+  }
+
+  function stopCamera() {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    opened = false;
+    okStreak = 0;
+    setStatus("카메라 정지됨.");
+  }
+
+  btnStart.addEventListener("click", startCamera);
+  btnStop.addEventListener("click", stopCamera);
+
+  if (location.protocol !== "https:" && location.hostname !== "localhost") {
+    setStatus("주의: 카메라는 HTTPS에서만 동작합니다. GitHub Pages로 배포하세요.");
+  }
+})();
+</script>
+</body>
+</html>

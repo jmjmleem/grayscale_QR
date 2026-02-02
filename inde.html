@@ -37,12 +37,15 @@
   const N = 8;
 
   // =========================
-  // 패턴 정의: 3레벨(0..2) 또는 4레벨(0..3) 혼용 가능
+  // 패턴 정의
+  //  - numLevels: 3 또는 4 (여기서 "3레벨/4레벨"을 명시적으로 인지)
+  //  - levels 값 범위: 3레벨이면 0..2, 4레벨이면 0..3
   // =========================
   const PATTERNS = [
     {
       id: "NPL_HOME",
       url: "https://npl.khu.ac.kr/",
+      numLevels: 4, // ✅ 4레벨 패턴
       levels: [
         [3,0,2,2,1,3,2,3],
         [3,2,3,0,1,0,3,2],
@@ -57,6 +60,7 @@
     {
       id: "OSK",
       url: "https://www.osk.or.kr/conference/event/index.php?cfrid=136",
+      numLevels: 3, // ✅ 3레벨 패턴
       levels: [
         [0,2,1,0,0,0,0,1],
         [1,0,1,1,0,2,1,1],
@@ -74,14 +78,9 @@
   // 튜닝
   // =========================
   const SCAN_INTERVAL_MS = 140;
-
-  // NOTE: 8x8 + affine fit 기준으로 80은 꽤 관대한 편.
-  // 오탐이 많으면 낮추고(예: 50~70), 인식이 안 되면 올리세요(예: 90~120).
-  const RMSE_THRESHOLD = 80;
-
+  const RMSE_THRESHOLD = 80;     // 오탐 많으면 낮추고, 미탐 많으면 올리기
   const DET_W = 480;
   const DET_H = 480;
-
   const WARP_SIZE = 300;
 
   // =========================
@@ -95,14 +94,12 @@
   function setStatus(msg) { statusEl.textContent = msg; }
 
   // =========================
-  // 안전/호환: 캔버스 컨텍스트 폴백
+  // 캔버스/컨텍스트 (Safari 폴백 포함)
   // =========================
   function get2DContextSafe(canvas) {
-    // Safari/일부 브라우저에서 willReadFrequently 옵션 때문에 null 반환되는 경우가 있어 폴백
     return canvas.getContext("2d", { willReadFrequently: true }) || canvas.getContext("2d");
   }
 
-  // 내부 캔버스들
   const detCanvas = document.createElement("canvas");
   detCanvas.width = DET_W; detCanvas.height = DET_H;
   const detCtx = get2DContextSafe(detCanvas);
@@ -117,25 +114,61 @@
   }
 
   // =========================
-  // 패턴 검증 + 레벨 매핑 자동 선택
+  // 레벨 ↔ 그레이 매핑 (numLevels로 강제)
+  // =========================
+  function levelToGrayForNumLevels(numLevels) {
+    if (numLevels === 3) return [0, 127.5, 255];
+    if (numLevels === 4) return [0, 85, 170, 255];
+    return null;
+  }
+
+  // 입력 obs를 3레벨/4레벨로 양자화(센터값으로 스냅)
+  function quantizeObsToLevels(obs, numLevels) {
+    const map = levelToGrayForNumLevels(numLevels);
+    const out = new Float32Array(obs.length);
+    if (!map) return out;
+
+    if (numLevels === 3) {
+      const t1 = (map[0] + map[1]) / 2;   // 63.75
+      const t2 = (map[1] + map[2]) / 2;   // 191.25
+      for (let i=0;i<obs.length;i++) {
+        const x = obs[i];
+        out[i] = (x < t1) ? map[0] : (x < t2) ? map[1] : map[2];
+      }
+      return out;
+    }
+
+    // numLevels === 4
+    const t1 = (map[0] + map[1]) / 2;     // 42.5
+    const t2 = (map[1] + map[2]) / 2;     // 127.5
+    const t3 = (map[2] + map[3]) / 2;     // 212.5
+    for (let i=0;i<obs.length;i++) {
+      const x = obs[i];
+      out[i] = (x < t1) ? map[0] : (x < t2) ? map[1] : (x < t3) ? map[2] : map[3];
+    }
+    return out;
+  }
+
+  // =========================
+  // 패턴 검증 (죽지 않고 status로 표시)
   // =========================
   function validatePattern(p) {
-    if (!Array.isArray(p.levels) || p.levels.length !== N) {
-      setStatus(`패턴 오류("${p.id}"): levels는 ${N}x${N}이어야 합니다.`);
-      console.error("Pattern size error:", p);
+    if (p.numLevels !== 3 && p.numLevels !== 4) {
+      setStatus(`패턴 오류("${p.id}"): numLevels는 3 또는 4여야 합니다.`);
+      console.error("numLevels error:", p);
       return false;
     }
+    if (!Array.isArray(p.levels) || p.levels.length !== N || !p.levels.every(r => Array.isArray(r) && r.length === N)) {
+      setStatus(`패턴 오류("${p.id}"): levels는 ${N}x${N}이어야 합니다.`);
+      console.error("size error:", p);
+      return false;
+    }
+    const maxAllowed = p.numLevels - 1;
     for (const row of p.levels) {
-      if (!Array.isArray(row) || row.length !== N) {
-        setStatus(`패턴 오류("${p.id}"): 행 길이가 ${N}이 아닙니다.`);
-        console.error("Pattern row error:", p);
-        return false;
-      }
       for (const v of row) {
-        // 3레벨(0..2) 또는 4레벨(0..3)만 허용
-        if (!Number.isFinite(v) || v < 0 || v > 3) {
-          setStatus(`패턴 오류("${p.id}"): 레벨 값 ${v} (허용: 0..3).`);
-          console.error("Pattern level error:", p);
+        if (!Number.isFinite(v) || v < 0 || v > maxAllowed) {
+          setStatus(`패턴 오류("${p.id}"): 레벨 값 ${v} (허용 0..${maxAllowed})`);
+          console.error("level range error:", p);
           return false;
         }
       }
@@ -145,21 +178,6 @@
 
   for (const p of PATTERNS) {
     if (!validatePattern(p)) return;
-  }
-
-  function maxLevelOf(levels2d) {
-    let m = 0;
-    for (const row of levels2d) for (const v of row) if (v > m) m = v;
-    return m;
-  }
-
-  function levelToGrayForMax(maxLevel) {
-    // maxLevel=2 -> 3레벨: [0, mid, 255]
-    // maxLevel=3 -> 4레벨: [0, 85, 170, 255]
-    if (maxLevel === 2) return [0, 127.5, 255];
-    if (maxLevel === 3) return [0, 85, 170, 255];
-    // 이 케이스는 사실상 패턴 검증에서 걸러져야 함
-    return null;
   }
 
   // =========================
@@ -175,32 +193,21 @@
     const v = new Float32Array(N*N);
     let k = 0;
     for (let r=0;r<N;r++) for (let c=0;c<N;c++) {
-      const lv = levels2d[r][c];
-      // lv가 0..2인데 4레벨 매핑을 써도 문제는 없지만(인덱싱 가능),
-      // 여기서는 패턴별로 정확한 매핑을 선택했으니 그대로 사용
-      v[k++] = levelToGray[lv];
+      v[k++] = levelToGray[levels2d[r][c]];
     }
     return v;
   }
 
   const ROT_PATTERNS = PATTERNS.map(p => {
+    const map = levelToGrayForNumLevels(p.numLevels);
     const r0 = p.levels;
-    const maxLv = maxLevelOf(r0);
-    const map = levelToGrayForMax(maxLv);
-
-    if (!map) {
-      setStatus(`패턴 오류("${p.id}"): maxLevel=${maxLv}는 지원하지 않습니다(0..2 또는 0..3만).`);
-      console.error("Unsupported max level:", p);
-      return null;
-    }
-
     const r1 = rotate90(r0);
     const r2 = rotate90(r1);
     const r3 = rotate90(r2);
-
     return {
       id: p.id,
       url: p.url,
+      numLevels: p.numLevels,
       targets: [
         levelsToTargetVec(r0, map),
         levelsToTargetVec(r1, map),
@@ -208,12 +215,7 @@
         levelsToTargetVec(r3, map),
       ]
     };
-  }).filter(Boolean);
-
-  if (ROT_PATTERNS.length === 0) {
-    setStatus("오류: 유효한 패턴이 없습니다.");
-    return;
-  }
+  });
 
   // =========================
   // 상태
@@ -230,7 +232,6 @@
     return 0.299*r + 0.587*g + 0.114*b;
   }
 
-  // ROI를 detCanvas로 가져오기(영상 전체를 정사각형으로 crop 후 다운샘플)
   function captureToDetCanvas() {
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) return false;
@@ -267,7 +268,6 @@
   // 사각형 4점 추정(간단)
   // =========================
   function estimateQuadFromEdges(mag, w, h) {
-    // 퍼센타일 임계값: 전체 sort (무겁지만 단순/확실). 필요하면 샘플링으로 바꿀 수 있음.
     const arr = Array.from(mag);
     arr.sort((a,b)=>a-b);
     const thr = arr[Math.floor(arr.length*0.92)] || 0; // 상위 8%
@@ -417,29 +417,15 @@
     const x1 = (c + 1) * cell - margin;
     const y1 = (r + 1) * cell - margin;
 
-    const vals = [];
+    let sum = 0, cnt = 0;
     for (let y = y0; y < y1; y++) {
       for (let x = x0; x < x1; x++) {
         const idx = (y * W + x) * 4;
-        vals.push(rgbToGray(data[idx], data[idx + 1], data[idx + 2]));
+        sum += rgbToGray(data[idx], data[idx + 1], data[idx + 2]);
+        cnt++;
       }
     }
-
-    // 안전: 값이 너무 적을 때(이론상 거의 없음) 처리
-    if (vals.length < 10) {
-      let sum = 0;
-      for (const v of vals) sum += v;
-      return vals.length ? (sum / vals.length) : 0;
-    }
-
-    // 트림 평균
-    vals.sort((a,b)=>a-b);
-    const cut = Math.floor(vals.length * 0.10);
-    const slice = vals.slice(cut, vals.length - cut);
-
-    let sum = 0;
-    for (const v of slice) sum += v;
-    return sum / slice.length;
+    return cnt ? (sum / cnt) : 0;
   }
 
   function extractGrayVecFromWarp(imgData) {
@@ -483,7 +469,7 @@
   }
 
   function passesContrastGate(obs) {
-    // 3레벨 패턴이 어두운 환경에서 미탐이 많으면 18 -> 14~16 정도로 낮춰보세요.
+    // 3레벨이 어두운 환경에서 미탐이면 18 -> 14~16으로 낮춰보세요
     const n=obs.length;
     let mean=0;
     for (let i=0;i<n;i++) mean += obs[i];
@@ -504,7 +490,6 @@
     }
 
     const mag = sobelEdges(gray, DET_W, DET_H);
-
     const quad = estimateQuadFromEdges(mag, DET_W, DET_H);
     if (!quad) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
@@ -514,13 +499,20 @@
     const obs = extractGrayVecFromWarp(warped);
     if (!passesContrastGate(obs)) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
+    // ✅ 입력 obs를 3레벨/4레벨로 각각 양자화
+    const obs3 = quantizeObsToLevels(obs, 3);
+    const obs4 = quantizeObsToLevels(obs, 4);
+
+    // ✅ 패턴 numLevels에 맞는 obs만 비교
     let best = Infinity, bestId=null, bestUrl=null;
     for (const p of ROT_PATTERNS) {
+      const obsQ = (p.numLevels === 3) ? obs3 : obs4;
       for (const t of p.targets) {
-        const s = rmseWithAffineFit(obs, t);
+        const s = rmseWithAffineFit(obsQ, t);
         if (s < best) { best = s; bestId=p.id; bestUrl=p.url; }
       }
     }
+
     return { best, ok: best <= RMSE_THRESHOLD, bestId, bestUrl };
   }
 
@@ -531,7 +523,6 @@
     try {
       res = scanFrameOnce();
     } catch (e) {
-      // 어떤 이유로든 프레임 처리 중 예외가 나면 죽지 말고 상태 표시
       console.error(e);
       setStatus("스캔 처리 중 오류(콘솔 확인): " + (e?.message || e));
       return;
@@ -540,11 +531,11 @@
     if (res.ok) okStreak++;
     else okStreak = Math.max(0, okStreak - 1);
 
-    setStatus(`스캔 중… score(RMSE)=${Number.isFinite(res.best)?res.best.toFixed(1):"inf"}, match=${res.bestId ?? "-"}, streak=${okStreak}`);
+    setStatus(`스캔 중… RMSE=${Number.isFinite(res.best)?res.best.toFixed(1):"inf"}, match=${res.bestId ?? "-"}, streak=${okStreak}`);
 
     if (okStreak >= 3 && res.bestUrl) {
       opened = true;
-      if (timer) { clearInterval(timer); timer = null; } // 성공 시 루프 정리
+      if (timer) { clearInterval(timer); timer = null; }
       setStatus(`인식 성공(${res.bestId})! 이동합니다…`);
       window.location.href = res.bestUrl;
     }
@@ -554,7 +545,6 @@
     opened = false;
     okStreak = 0;
 
-    // 중복 시작 방지
     if (timer) { clearInterval(timer); timer = null; }
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
 
@@ -564,20 +554,17 @@
         video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false
       });
-
       video.srcObject = stream;
 
       btnStart.disabled = true;
       btnStop.disabled = false;
 
-      // iOS/Safari 안정화: metadata+재생 보장
       await new Promise(resolve => {
         if (video.readyState >= 2) resolve();
         else video.onloadedmetadata = () => resolve();
       });
 
-      // 일부 브라우저는 사용자 제스처 후에도 play가 reject될 수 있어 try/catch
-      try { await video.play(); } catch (e) { /* 무시: autoplay 정책 */ }
+      try { await video.play(); } catch (e) { /* autoplay 정책 등 */ }
 
       setStatus("스캔 시작! (자동으로 사각형을 찾습니다)");
       timer = setInterval(loop, SCAN_INTERVAL_MS);

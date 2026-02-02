@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GrayCode Camera Scanner</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    video { width: 100%; max-height: 70vh; background: #111; border-radius: 12px; object-fit: cover; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0; }
+    button { padding: 10px 12px; font-size: 16px; }
+    .status { padding: 10px 12px; background: #f3f4f6; border-radius: 12px; }
+    .hint { color:#444; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>그레이 코드 실시간 인식</h2>
+    <p class="hint">코드를 화면 중앙에 크게 맞추면 자동으로 이동합니다.</p>
+
+    <div class="row">
+      <button id="start">카메라 시작</button>
+      <button id="stop" disabled>카메라 정지</button>
+    </div>
+
+    <div class="status" id="status">대기 중…</div>
+
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+  </div>
+
+<script>
+(() => {
+  // =========================
+  // 8x8 전용
+  // =========================
+  const N = 8;
+
+  // =========================
+  // 패턴 정의: 3레벨(0..2) 또는 4레벨(0..3) 혼용 가능
+  // =========================
+  const PATTERNS = [
+    {
+      id: "NPL_HOME",
+      url: "https://npl.khu.ac.kr/",
+      levels: [
+        [3,0,2,2,1,3,2,3],
+        [3,2,3,0,1,0,3,2],
+        [0,1,1,1,0,3,1,1],
+        [1,2,0,2,0,3,3,3],
+        [3,2,3,0,0,1,2,0],
+        [0,0,2,3,0,0,1,1],
+        [2,3,3,3,2,3,2,2],
+        [2,2,1,1,2,3,2,2]
+      ],
+    },
+    {
+      id: "OSK",
+      url: "https://www.osk.or.kr/conference/event/index.php?cfrid=136",
+      levels: [
+        [0,2,1,0,0,0,0,1],
+        [1,0,1,1,0,2,1,1],
+        [2,0,0,2,1,2,2,1],
+        [0,0,1,0,1,0,0,2],
+        [2,1,0,2,0,1,0,0],
+        [1,2,2,1,2,1,2,0],
+        [0,2,2,0,0,2,1,0],
+        [1,0,2,2,1,0,0,1]
+      ],
+    }
+  ];
+
+  // =========================
+  // 튜닝
+  // =========================
+  const SCAN_INTERVAL_MS = 140;
+  const RMSE_THRESHOLD = 80; // 필요 시 조절
+  const DET_W = 480;
+  const DET_H = 480;
+  const WARP_SIZE = 300;
+
+  // =========================
+  // 유틸: 패턴 검증 + 레벨 매핑 자동 선택
+  // =========================
+  function assertPattern8x8AndLevels(p) {
+    if (!Array.isArray(p.levels) || p.levels.length !== N) {
+      throw new Error(`Pattern "${p.id}" must be ${N}x${N}. got ${p.levels?.length}x${p.levels?.[0]?.length}`);
+    }
+    for (const row of p.levels) {
+      if (!Array.isArray(row) || row.length !== N) {
+        throw new Error(`Pattern "${p.id}" must be ${N}x${N}. got ragged row`);
+      }
+      for (const v of row) {
+        if (!Number.isFinite(v) || v < 0 || v > 3) {
+          throw new Error(`Pattern "${p.id}" has invalid level "${v}". allowed: 0..3`);
+        }
+      }
+    }
+  }
+
+  function maxLevelOf(levels2d) {
+    let m = 0;
+    for (const row of levels2d) for (const v of row) if (v > m) m = v;
+    return m;
+  }
+
+  function levelToGrayForMax(maxLevel) {
+    // maxLevel=2 -> 3레벨(0,1,2)
+    // maxLevel=3 -> 4레벨(0,1,2,3)
+    if (maxLevel === 2) return [0, 127.5, 255];
+    if (maxLevel === 3) return [0, 85, 170, 255];
+    throw new Error(`Unsupported maxLevel=${maxLevel}. levels는 0..2 또는 0..3만 허용`);
+  }
+
+  // 패턴 검증(실수 방지)
+  for (const p of PATTERNS) assertPattern8x8AndLevels(p);
+
+  // =========================
+  // 회전/템플릿
+  // =========================
+  function rotate90(m) {
+    const out = Array.from({length:N}, () => Array(N).fill(0));
+    for (let r=0;r<N;r++) for (let c=0;c<N;c++) out[c][N-1-r] = m[r][c];
+    return out;
+  }
+
+  function levelsToTargetVec(levels2d, levelToGray) {
+    const v = new Float32Array(N*N);
+    let k = 0;
+    for (let r=0;r<N;r++) for (let c=0;c<N;c++) {
+      const lv = levels2d[r][c];
+      v[k++] = levelToGray[lv];
+    }
+    return v;
+  }
+
+  const ROT_PATTERNS = PATTERNS.map(p => {
+    const r0 = p.levels;
+    const maxLv = maxLevelOf(r0);         // 2 or 3
+    const map = levelToGrayForMax(maxLv); // 3레벨/4레벨용 매핑 자동
+
+    const r1 = rotate90(r0);
+    const r2 = rotate90(r1);
+    const r3 = rotate90(r2);
+    return {
+      id: p.id,
+      url: p.url,
+      targets: [
+        levelsToTargetVec(r0, map),
+        levelsToTargetVec(r1, map),
+        levelsToTargetVec(r2, map),
+        levelsToTargetVec(r3, map)
+      ]
+    };
+  });
+
+  // =========================
+  // DOM
+  // =========================
+  const statusEl = document.getElementById("status");
+  const video = document.getElementById("video");
+  const btnStart = document.getElementById("start");
+  const btnStop  = document.getElementById("stop");
+
+  video.style.objectFit = "cover";
+
+  // 내부 캔버스들
+  const detCanvas = document.createElement("canvas");
+  detCanvas.width = DET_W; detCanvas.height = DET_H;
+  const detCtx = detCanvas.getContext("2d", { willReadFrequently: true });
+
+  const warpCanvas = document.createElement("canvas");
+  warpCanvas.width = WARP_SIZE; warpCanvas.height = WARP_SIZE;
+  const warpCtx = warpCanvas.getContext("2d", { willReadFrequently: true });
+
+  let stream = null;
+  let timer = null;
+  let opened = false;
+  let okStreak = 0;
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  // =========================
+  // 기본 유틸
+  // =========================
+  function rgbToGray(r, g, b) {
+    return 0.299*r + 0.587*g + 0.114*b;
+  }
+
+  // ROI를 detCanvas로 가져오기(영상 전체를 정사각형으로 crop 후 다운샘플)
+  function captureToDetCanvas() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return false;
+
+    const s = Math.min(vw, vh);
+    const sx = Math.floor((vw - s)/2);
+    const sy = Math.floor((vh - s)/2);
+    detCtx.drawImage(video, sx, sy, s, s, 0, 0, DET_W, DET_H);
+    return true;
+  }
+
+  // =========================
+  // 에지 계산(소벨)
+  // =========================
+  function sobelEdges(gray, w, h) {
+    const mag = new Float32Array(w*h);
+    const idx = (x,y)=>y*w+x;
+    for (let y=1;y<h-1;y++) {
+      for (let x=1;x<w-1;x++) {
+        const gx =
+          -gray[idx(x-1,y-1)] + gray[idx(x+1,y-1)] +
+          -2*gray[idx(x-1,y)]   + 2*gray[idx(x+1,y)] +
+          -gray[idx(x-1,y+1)] + gray[idx(x+1,y+1)];
+        const gy =
+          -gray[idx(x-1,y-1)] -2*gray[idx(x,y-1)] -gray[idx(x+1,y-1)] +
+           gray[idx(x-1,y+1)] +2*gray[idx(x,y+1)] +gray[idx(x+1,y+1)];
+        mag[idx(x,y)] = Math.abs(gx) + Math.abs(gy);
+      }
+    }
+    return mag;
+  }
+
+  // =========================
+  // 사각형 4점 추정(간단)
+  // =========================
+  function estimateQuadFromEdges(mag, w, h) {
+    const arr = Array.from(mag);
+    arr.sort((a,b)=>a-b);
+    const thr = arr[Math.floor(arr.length*0.92)] || 0; // 상위 8%
+    if (thr <= 0) return null;
+
+    let tl=null,tr=null,br=null,bl=null;
+    let bestTL=Infinity, bestTR=Infinity, bestBR=-Infinity, bestBL=-Infinity;
+
+    for (let y=0;y<h;y++) {
+      for (let x=0;x<w;x++) {
+        const m = mag[y*w+x];
+        if (m < thr) continue;
+
+        const s1 = x + y;
+        const s2 = -x + y;
+
+        if (s1 < bestTL) { bestTL = s1; tl = {x,y}; }
+        if (s2 < bestTR) { bestTR = s2; tr = {x,y}; }
+        if (s1 > bestBR) { bestBR = s1; br = {x,y}; }
+        if (s2 > bestBL) { bestBL = s2; bl = {x,y}; }
+      }
+    }
+
+    if (!tl || !tr || !br || !bl) return null;
+
+    const areaApprox = Math.abs((br.x-tl.x)*(br.y-tl.y));
+    if (areaApprox < (w*h*0.02)) return null;
+
+    return [tl,tr,br,bl];
+  }
+
+  // =========================
+  // 호모그래피/원근 보정
+  // =========================
+  function computeHomography(src, dst) {
+    const A = [];
+    const b = [];
+    for (let i=0;i<4;i++) {
+      const x = src[i].x, y = src[i].y;
+      const u = dst[i].x, v = dst[i].y;
+      A.push([x,y,1, 0,0,0, -u*x, -u*y]); b.push(u);
+      A.push([0,0,0, x,y,1, -v*x, -v*y]); b.push(v);
+    }
+    const n = 8;
+    for (let col=0; col<n; col++) {
+      let pivot = col;
+      for (let r=col+1;r<n;r++) if (Math.abs(A[r][col]) > Math.abs(A[pivot][col])) pivot = r;
+      [A[col], A[pivot]] = [A[pivot], A[col]];
+      [b[col], b[pivot]] = [b[pivot], b[col]];
+
+      const div = A[col][col];
+      if (Math.abs(div) < 1e-9) return null;
+      for (let c=col;c<n;c++) A[col][c] /= div;
+      b[col] /= div;
+
+      for (let r=0;r<n;r++) {
+        if (r===col) continue;
+        const factor = A[r][col];
+        for (let c=col;c<n;c++) A[r][c] -= factor*A[col][c];
+        b[r] -= factor*b[col];
+      }
+    }
+    const h = b;
+    return [
+      [h[0],h[1],h[2]],
+      [h[3],h[4],h[5]],
+      [h[6],h[7],1]
+    ];
+  }
+
+  function invert3x3(M) {
+    const a=M[0][0], b=M[0][1], c=M[0][2];
+    const d=M[1][0], e=M[1][1], f=M[1][2];
+    const g=M[2][0], h=M[2][1], i=M[2][2];
+    const A = e*i - f*h;
+    const B = -(d*i - f*g);
+    const C = d*h - e*g;
+    const D = -(b*i - c*h);
+    const E = a*i - c*g;
+    const F = -(a*h - b*g);
+    const G = b*f - c*e;
+    const H = -(a*f - c*d);
+    const I = a*e - b*d;
+    const det = a*A + b*B + c*C;
+    if (Math.abs(det) < 1e-9) return null;
+    const invDet = 1/det;
+    return [
+      [A*invDet, D*invDet, G*invDet],
+      [B*invDet, E*invDet, H*invDet],
+      [C*invDet, F*invDet, I*invDet]
+    ];
+  }
+
+  function applyH(H, x, y) {
+    const nx = H[0][0]*x + H[0][1]*y + H[0][2];
+    const ny = H[1][0]*x + H[1][1]*y + H[1][2];
+    const nz = H[2][0]*x + H[2][1]*y + H[2][2];
+    return { x: nx/nz, y: ny/nz };
+  }
+
+  function warpFromDetCanvas(quad) {
+    const dst = [
+      {x:0, y:0},
+      {x:WARP_SIZE-1, y:0},
+      {x:WARP_SIZE-1, y:WARP_SIZE-1},
+      {x:0, y:WARP_SIZE-1},
+    ];
+    const H = computeHomography(quad, dst);
+    if (!H) return null;
+    const Hinv = invert3x3(H);
+    if (!Hinv) return null;
+
+    const srcImg = detCtx.getImageData(0,0,DET_W,DET_H);
+    const sdata = srcImg.data;
+
+    const out = warpCtx.createImageData(WARP_SIZE, WARP_SIZE);
+    const odata = out.data;
+
+    for (let y=0;y<WARP_SIZE;y++) {
+      for (let x=0;x<WARP_SIZE;x++) {
+        const p = applyH(Hinv, x, y);
+        const u = Math.max(0, Math.min(DET_W-1, p.x));
+        const v = Math.max(0, Math.min(DET_H-1, p.y));
+        const uu = Math.floor(u), vv = Math.floor(v);
+        const idx = (vv*DET_W + uu)*4;
+
+        const odx = (y*WARP_SIZE + x)*4;
+        odata[odx]   = sdata[idx];
+        odata[odx+1] = sdata[idx+1];
+        odata[odx+2] = sdata[idx+2];
+        odata[odx+3] = 255;
+      }
+    }
+    warpCtx.putImageData(out, 0, 0);
+    return out; // ImageData
+  }
+
+  // =========================
+  // 8x8 추출 + 매칭
+  // =========================
+  function cellMeanGray(imgData, W, r, c, cell) {
+    const { data } = imgData;
+
+    const margin = Math.max(1, Math.floor(cell * 0.20));
+    const x0 = c * cell + margin;
+    const y0 = r * cell + margin;
+    const x1 = (c + 1) * cell - margin;
+    const y1 = (r + 1) * cell - margin;
+
+    const vals = [];
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const idx = (y * W + x) * 4;
+        vals.push(rgbToGray(data[idx], data[idx + 1], data[idx + 2]));
+      }
+    }
+
+    vals.sort((a,b)=>a-b);
+    const cut = Math.floor(vals.length * 0.10);
+    const slice = vals.slice(cut, vals.length - cut);
+
+    let sum = 0;
+    for (const v of slice) sum += v;
+    return sum / slice.length;
+  }
+
+  function extractGrayVecFromWarp(imgData) {
+    const W = WARP_SIZE;
+    const cell = Math.floor(W / N);
+    const v = new Float32Array(N*N);
+    let k=0;
+    for (let r=0;r<N;r++) {
+      for (let c=0;c<N;c++) {
+        v[k++] = cellMeanGray(imgData, W, r, c, cell);
+      }
+    }
+    return v;
+  }
+
+  function rmseWithAffineFit(obs, target) {
+    const n = obs.length;

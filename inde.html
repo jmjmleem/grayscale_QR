@@ -27,25 +27,19 @@
     <div class="status" id="status">대기 중…</div>
 
     <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas" style="display:none;"></canvas>
   </div>
 
 <script>
 (() => {
-  // =========================
-  // 8x8 전용
-  // =========================
   const N = 8;
 
-  // =========================
-  // 패턴 정의
-  //  - numLevels: 3 또는 4 (여기서 "3레벨/4레벨"을 명시적으로 인지)
-  //  - levels 값 범위: 3레벨이면 0..2, 4레벨이면 0..3
-  // =========================
+  // ✅ 패턴에 numLevels 명시(3 or 4)
   const PATTERNS = [
     {
       id: "NPL_HOME",
       url: "https://npl.khu.ac.kr/",
-      numLevels: 4, // ✅ 4레벨 패턴
+      numLevels: 4,
       levels: [
         [3,0,2,2,1,3,2,3],
         [3,2,3,0,1,0,3,2],
@@ -60,7 +54,7 @@
     {
       id: "OSK",
       url: "https://www.osk.or.kr/conference/event/index.php?cfrid=136",
-      numLevels: 3, // ✅ 3레벨 패턴
+      numLevels: 3,
       levels: [
         [0,2,1,0,0,0,0,1],
         [1,0,1,1,0,2,1,1],
@@ -74,101 +68,64 @@
     }
   ];
 
-  // =========================
-  // 튜닝
-  // =========================
+  // ===== 튜닝 =====
   const SCAN_INTERVAL_MS = 140;
-  const RMSE_THRESHOLD = 80;     // 오탐 많으면 낮추고, 미탐 많으면 올리기
+  const RMSE_THRESHOLD = 80;
+
   const DET_W = 480;
   const DET_H = 480;
+
   const WARP_SIZE = 300;
 
-  // =========================
-  // DOM
-  // =========================
+  // ===== DOM =====
   const statusEl = document.getElementById("status");
   const video = document.getElementById("video");
+  const canvas = document.getElementById("canvas");
   const btnStart = document.getElementById("start");
   const btnStop  = document.getElementById("stop");
 
+  video.style.objectFit = "cover";
+
   function setStatus(msg) { statusEl.textContent = msg; }
 
-  // =========================
-  // 캔버스/컨텍스트 (Safari 폴백 포함)
-  // =========================
-  function get2DContextSafe(canvas) {
-    return canvas.getContext("2d", { willReadFrequently: true }) || canvas.getContext("2d");
+  // ===== Safari/호환 폴백: willReadFrequently 옵션 실패 대비 =====
+  function get2dSafe(c) {
+    return c.getContext("2d", { willReadFrequently: true }) || c.getContext("2d");
   }
 
+  // 내부 캔버스들
   const detCanvas = document.createElement("canvas");
   detCanvas.width = DET_W; detCanvas.height = DET_H;
-  const detCtx = get2DContextSafe(detCanvas);
+  const detCtx = get2dSafe(detCanvas);
 
   const warpCanvas = document.createElement("canvas");
   warpCanvas.width = WARP_SIZE; warpCanvas.height = WARP_SIZE;
-  const warpCtx = get2DContextSafe(warpCanvas);
+  const warpCtx = get2dSafe(warpCanvas);
 
   if (!detCtx || !warpCtx) {
-    setStatus("오류: 캔버스 2D 컨텍스트 생성 실패(브라우저 호환성). 다른 브라우저로 시도하세요.");
+    setStatus("오류: 캔버스 2D 컨텍스트 생성 실패(브라우저 호환성).");
     return;
   }
 
-  // =========================
-  // 레벨 ↔ 그레이 매핑 (numLevels로 강제)
-  // =========================
-  function levelToGrayForNumLevels(numLevels) {
-    if (numLevels === 3) return [0, 127.5, 255];
-    if (numLevels === 4) return [0, 85, 170, 255];
-    return null;
-  }
-
-  // 입력 obs를 3레벨/4레벨로 양자화(센터값으로 스냅)
-  function quantizeObsToLevels(obs, numLevels) {
-    const map = levelToGrayForNumLevels(numLevels);
-    const out = new Float32Array(obs.length);
-    if (!map) return out;
-
-    if (numLevels === 3) {
-      const t1 = (map[0] + map[1]) / 2;   // 63.75
-      const t2 = (map[1] + map[2]) / 2;   // 191.25
-      for (let i=0;i<obs.length;i++) {
-        const x = obs[i];
-        out[i] = (x < t1) ? map[0] : (x < t2) ? map[1] : map[2];
-      }
-      return out;
-    }
-
-    // numLevels === 4
-    const t1 = (map[0] + map[1]) / 2;     // 42.5
-    const t2 = (map[1] + map[2]) / 2;     // 127.5
-    const t3 = (map[2] + map[3]) / 2;     // 212.5
-    for (let i=0;i<obs.length;i++) {
-      const x = obs[i];
-      out[i] = (x < t1) ? map[0] : (x < t2) ? map[1] : (x < t3) ? map[2] : map[3];
-    }
-    return out;
-  }
-
-  // =========================
-  // 패턴 검증 (죽지 않고 status로 표시)
-  // =========================
+  // ===== 패턴 검증(페이지 죽이지 않고 status로) =====
   function validatePattern(p) {
     if (p.numLevels !== 3 && p.numLevels !== 4) {
-      setStatus(`패턴 오류("${p.id}"): numLevels는 3 또는 4여야 합니다.`);
-      console.error("numLevels error:", p);
+      setStatus(`패턴 오류(${p.id}): numLevels는 3 또는 4여야 합니다.`);
       return false;
     }
-    if (!Array.isArray(p.levels) || p.levels.length !== N || !p.levels.every(r => Array.isArray(r) && r.length === N)) {
-      setStatus(`패턴 오류("${p.id}"): levels는 ${N}x${N}이어야 합니다.`);
-      console.error("size error:", p);
+    if (!Array.isArray(p.levels) || p.levels.length !== N) {
+      setStatus(`패턴 오류(${p.id}): levels는 ${N}x${N}이어야 합니다.`);
       return false;
     }
-    const maxAllowed = p.numLevels - 1;
     for (const row of p.levels) {
+      if (!Array.isArray(row) || row.length !== N) {
+        setStatus(`패턴 오류(${p.id}): levels는 ${N}x${N}이어야 합니다.`);
+        return false;
+      }
+      const maxAllowed = p.numLevels - 1;
       for (const v of row) {
         if (!Number.isFinite(v) || v < 0 || v > maxAllowed) {
-          setStatus(`패턴 오류("${p.id}"): 레벨 값 ${v} (허용 0..${maxAllowed})`);
-          console.error("level range error:", p);
+          setStatus(`패턴 오류(${p.id}): 레벨 ${v} (허용 0..${maxAllowed})`);
           return false;
         }
       }
@@ -180,26 +137,54 @@
     if (!validatePattern(p)) return;
   }
 
-  // =========================
-  // 회전/템플릿
-  // =========================
+  // ===== 레벨→그레이 매핑 (numLevels 기반) =====
+  function levelToGray(numLevels) {
+    // 3레벨: 0, 127.5, 255
+    // 4레벨: 0, 85, 170, 255
+    return (numLevels === 3) ? [0,127.5,255] : [0,85,170,255];
+  }
+
+  // 관측값 obs를 3레벨/4레벨로 각각 양자화해서 비교 안정화
+  function quantizeObs(obs, numLevels) {
+    const map = levelToGray(numLevels);
+    const out = new Float32Array(obs.length);
+
+    if (numLevels === 3) {
+      const t1 = (map[0] + map[1]) / 2;
+      const t2 = (map[1] + map[2]) / 2;
+      for (let i=0;i<obs.length;i++) {
+        const x = obs[i];
+        out[i] = (x < t1) ? map[0] : (x < t2) ? map[1] : map[2];
+      }
+      return out;
+    }
+
+    const t1 = (map[0] + map[1]) / 2;
+    const t2 = (map[1] + map[2]) / 2;
+    const t3 = (map[2] + map[3]) / 2;
+    for (let i=0;i<obs.length;i++) {
+      const x = obs[i];
+      out[i] = (x < t1) ? map[0] : (x < t2) ? map[1] : (x < t3) ? map[2] : map[3];
+    }
+    return out;
+  }
+
+  // ===== 회전/템플릿 =====
   function rotate90(m) {
     const out = Array.from({length:N}, () => Array(N).fill(0));
     for (let r=0;r<N;r++) for (let c=0;c<N;c++) out[c][N-1-r] = m[r][c];
     return out;
   }
 
-  function levelsToTargetVec(levels2d, levelToGray) {
+  function levelsToTargetVec(levels2d, map) {
     const v = new Float32Array(N*N);
     let k = 0;
-    for (let r=0;r<N;r++) for (let c=0;c<N;c++) {
-      v[k++] = levelToGray[levels2d[r][c]];
-    }
+    for (let r=0;r<N;r++) for (let c=0;c<N;c++) v[k++] = map[levels2d[r][c]];
     return v;
   }
 
   const ROT_PATTERNS = PATTERNS.map(p => {
-    const map = levelToGrayForNumLevels(p.numLevels);
+    const map = levelToGray(p.numLevels);
     const r0 = p.levels;
     const r1 = rotate90(r0);
     const r2 = rotate90(r1);
@@ -217,17 +202,12 @@
     };
   });
 
-  // =========================
-  // 상태
-  // =========================
   let stream = null;
   let timer = null;
   let opened = false;
   let okStreak = 0;
 
-  // =========================
-  // 기본 유틸
-  // =========================
+  // ===== 기본 유틸 =====
   function rgbToGray(r, g, b) {
     return 0.299*r + 0.587*g + 0.114*b;
   }
@@ -243,9 +223,7 @@
     return true;
   }
 
-  // =========================
-  // 에지 계산(소벨)
-  // =========================
+  // ===== 소벨 =====
   function sobelEdges(gray, w, h) {
     const mag = new Float32Array(w*h);
     const idx = (x,y)=>y*w+x;
@@ -264,13 +242,11 @@
     return mag;
   }
 
-  // =========================
-  // 사각형 4점 추정(간단)
-  // =========================
+  // ===== quad 추정 =====
   function estimateQuadFromEdges(mag, w, h) {
     const arr = Array.from(mag);
     arr.sort((a,b)=>a-b);
-    const thr = arr[Math.floor(arr.length*0.92)] || 0; // 상위 8%
+    const thr = arr[Math.floor(arr.length*0.92)] || 0;
     if (thr <= 0) return null;
 
     let tl=null,tr=null,br=null,bl=null;
@@ -299,9 +275,7 @@
     return [tl,tr,br,bl];
   }
 
-  // =========================
-  // 호모그래피/원근 보정
-  // =========================
+  // ===== homography =====
   function computeHomography(src, dst) {
     const A = [];
     const b = [];
@@ -405,9 +379,7 @@
     return out;
   }
 
-  // =========================
-  // 8x8 추출 + 매칭
-  // =========================
+  // ===== 8x8 추출 =====
   function cellMeanGray(imgData, W, r, c, cell) {
     const { data } = imgData;
 
@@ -417,15 +389,27 @@
     const x1 = (c + 1) * cell - margin;
     const y1 = (r + 1) * cell - margin;
 
-    let sum = 0, cnt = 0;
+    const vals = [];
     for (let y = y0; y < y1; y++) {
       for (let x = x0; x < x1; x++) {
         const idx = (y * W + x) * 4;
-        sum += rgbToGray(data[idx], data[idx + 1], data[idx + 2]);
-        cnt++;
+        vals.push(rgbToGray(data[idx], data[idx + 1], data[idx + 2]));
       }
     }
-    return cnt ? (sum / cnt) : 0;
+
+    if (vals.length < 10) {
+      let sum = 0;
+      for (const v of vals) sum += v;
+      return vals.length ? sum / vals.length : 0;
+    }
+
+    vals.sort((a,b)=>a-b);
+    const cut = Math.floor(vals.length * 0.10);
+    const slice = vals.slice(cut, vals.length - cut);
+
+    let sum = 0;
+    for (const v of slice) sum += v;
+    return sum / slice.length;
   }
 
   function extractGrayVecFromWarp(imgData) {
@@ -469,7 +453,6 @@
   }
 
   function passesContrastGate(obs) {
-    // 3레벨이 어두운 환경에서 미탐이면 18 -> 14~16으로 낮춰보세요
     const n=obs.length;
     let mean=0;
     for (let i=0;i<n;i++) mean += obs[i];
@@ -478,6 +461,19 @@
     for (let i=0;i<n;i++) { const d=obs[i]-mean; v += d*d; }
     v/=n;
     return Math.sqrt(v) >= 18;
+  }
+
+  // ✅ 404 방지용 URL 검증: 이상한 값이면 이동하지 않음
+  function safeNavigate(url) {
+    try {
+      const u = new URL(url);                 // 절대 URL만 허용
+      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("bad protocol");
+      // replace를 쓰면 연속 이동/뒤로가기 문제도 줄어듦
+      window.location.replace(u.href);
+    } catch (e) {
+      console.error("Bad URL:", url, e);
+      setStatus(`이동 실패(잘못된 URL): ${String(url)}`);
+    }
   }
 
   function scanFrameOnce() {
@@ -499,11 +495,10 @@
     const obs = extractGrayVecFromWarp(warped);
     if (!passesContrastGate(obs)) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
-    // ✅ 입력 obs를 3레벨/4레벨로 각각 양자화
-    const obs3 = quantizeObsToLevels(obs, 3);
-    const obs4 = quantizeObsToLevels(obs, 4);
+    // ✅ 관측값을 3레벨/4레벨 각각 양자화
+    const obs3 = quantizeObs(obs, 3);
+    const obs4 = quantizeObs(obs, 4);
 
-    // ✅ 패턴 numLevels에 맞는 obs만 비교
     let best = Infinity, bestId=null, bestUrl=null;
     for (const p of ROT_PATTERNS) {
       const obsQ = (p.numLevels === 3) ? obs3 : obs4;
@@ -512,7 +507,6 @@
         if (s < best) { best = s; bestId=p.id; bestUrl=p.url; }
       }
     }
-
     return { best, ok: best <= RMSE_THRESHOLD, bestId, bestUrl };
   }
 
@@ -535,18 +529,15 @@
 
     if (okStreak >= 3 && res.bestUrl) {
       opened = true;
-      if (timer) { clearInterval(timer); timer = null; }
+      if (timer) { clearInterval(timer); timer = null; } // ✅ 중복 이동 방지
       setStatus(`인식 성공(${res.bestId})! 이동합니다…`);
-      window.location.href = res.bestUrl;
+      safeNavigate(res.bestUrl); // ✅ URL 검증 후 이동
     }
   }
 
   async function startCamera() {
     opened = false;
     okStreak = 0;
-
-    if (timer) { clearInterval(timer); timer = null; }
-    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
 
     setStatus("카메라 권한 요청 중…");
     try {
@@ -564,16 +555,13 @@
         else video.onloadedmetadata = () => resolve();
       });
 
-      try { await video.play(); } catch (e) { /* autoplay 정책 등 */ }
+      // iOS 일부 환경 안정화
+      try { await video.play(); } catch (e) {}
 
       setStatus("스캔 시작! (자동으로 사각형을 찾습니다)");
       timer = setInterval(loop, SCAN_INTERVAL_MS);
     } catch (err) {
-      console.error(err);
       setStatus("카메라 시작 실패: " + (err?.name ? `${err.name} - ${err.message || ""}` : err));
-      btnStart.disabled = false;
-      btnStop.disabled = true;
-      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     }
   }
 

@@ -34,12 +34,12 @@
 (() => {
   const N = 8;
 
-  // ✅ 패턴에 numLevels 명시(3 or 4)
+  // ✅ 패턴마다 3레벨/4레벨을 "명시"해서 인지
   const PATTERNS = [
     {
       id: "NPL_HOME",
       url: "https://npl.khu.ac.kr/",
-      numLevels: 4,
+      numLevels: 4, // 0..3
       levels: [
         [3,0,2,2,1,3,2,3],
         [3,2,3,0,1,0,3,2],
@@ -54,7 +54,7 @@
     {
       id: "OSK",
       url: "https://www.osk.or.kr/conference/event/index.php?cfrid=136",
-      numLevels: 3,
+      numLevels: 3, // 0..2
       levels: [
         [0,2,1,0,0,0,0,1],
         [1,0,1,1,0,2,1,1],
@@ -71,29 +71,47 @@
   // ===== 튜닝 =====
   const SCAN_INTERVAL_MS = 140;
   const RMSE_THRESHOLD = 80;
-
-  const DET_W = 480;
-  const DET_H = 480;
-
+  const DET_W = 480, DET_H = 480;
   const WARP_SIZE = 300;
 
   // ===== DOM =====
   const statusEl = document.getElementById("status");
   const video = document.getElementById("video");
-  const canvas = document.getElementById("canvas");
   const btnStart = document.getElementById("start");
   const btnStop  = document.getElementById("stop");
 
-  video.style.objectFit = "cover";
-
   function setStatus(msg) { statusEl.textContent = msg; }
 
-  // ===== Safari/호환 폴백: willReadFrequently 옵션 실패 대비 =====
-  function get2dSafe(c) {
-    return c.getContext("2d", { willReadFrequently: true }) || c.getContext("2d");
+  // ===== 404 원천 차단: 외부 절대 URL만 이동 허용 =====
+  function safeNavigate(url) {
+    try {
+      if (typeof url !== "string") throw new Error("url is not string");
+
+      // trim & normalize
+      const s = url.trim();
+
+      // 반드시 https:// 또는 http:// 로 시작해야만 이동
+      if (!/^https?:\/\//i.test(s)) {
+        throw new Error("not absolute http(s) url: " + s);
+      }
+
+      // URL 파싱 (이상하면 예외)
+      const u = new URL(s);
+
+      // 최종 이동(중복 이동 방지 위해 replace 사용)
+      window.location.replace(u.href);
+    } catch (e) {
+      console.error("Navigate blocked:", url, e);
+      setStatus("이동 차단(잘못된 URL): " + String(url));
+      // ✅ 여기서 끝. 절대 GitHub Pages 내부 경로로는 안 감.
+    }
   }
 
-  // 내부 캔버스들
+  // ===== 컨텍스트 폴백(willReadFrequently 미지원 브라우저) =====
+  function get2dSafe(canvas) {
+    return canvas.getContext("2d", { willReadFrequently: true }) || canvas.getContext("2d");
+  }
+
   const detCanvas = document.createElement("canvas");
   detCanvas.width = DET_W; detCanvas.height = DET_H;
   const detCtx = get2dSafe(detCanvas);
@@ -107,28 +125,33 @@
     return;
   }
 
-  // ===== 패턴 검증(페이지 죽이지 않고 status로) =====
+  // ===== 패턴 검증 =====
   function validatePattern(p) {
     if (p.numLevels !== 3 && p.numLevels !== 4) {
-      setStatus(`패턴 오류(${p.id}): numLevels는 3 또는 4여야 합니다.`);
+      setStatus(`패턴 오류(${p.id}): numLevels는 3 또는 4`);
       return false;
     }
     if (!Array.isArray(p.levels) || p.levels.length !== N) {
-      setStatus(`패턴 오류(${p.id}): levels는 ${N}x${N}이어야 합니다.`);
+      setStatus(`패턴 오류(${p.id}): levels는 ${N}x${N}`);
       return false;
     }
+    const maxAllowed = p.numLevels - 1;
     for (const row of p.levels) {
       if (!Array.isArray(row) || row.length !== N) {
-        setStatus(`패턴 오류(${p.id}): levels는 ${N}x${N}이어야 합니다.`);
+        setStatus(`패턴 오류(${p.id}): levels는 ${N}x${N}`);
         return false;
       }
-      const maxAllowed = p.numLevels - 1;
       for (const v of row) {
         if (!Number.isFinite(v) || v < 0 || v > maxAllowed) {
           setStatus(`패턴 오류(${p.id}): 레벨 ${v} (허용 0..${maxAllowed})`);
           return false;
         }
       }
+    }
+    // URL도 미리 검증(프로토콜 없는 URL 방지)
+    if (typeof p.url !== "string" || !/^https?:\/\//i.test(p.url.trim())) {
+      setStatus(`패턴 오류(${p.id}): url은 반드시 https://... 형태`);
+      return false;
     }
     return true;
   }
@@ -137,14 +160,12 @@
     if (!validatePattern(p)) return;
   }
 
-  // ===== 레벨→그레이 매핑 (numLevels 기반) =====
+  // ===== 레벨→그레이 =====
   function levelToGray(numLevels) {
-    // 3레벨: 0, 127.5, 255
-    // 4레벨: 0, 85, 170, 255
-    return (numLevels === 3) ? [0,127.5,255] : [0,85,170,255];
+    return (numLevels === 3) ? [0, 127.5, 255] : [0, 85, 170, 255];
   }
 
-  // 관측값 obs를 3레벨/4레벨로 각각 양자화해서 비교 안정화
+  // obs를 3/4레벨 각각 양자화
   function quantizeObs(obs, numLevels) {
     const map = levelToGray(numLevels);
     const out = new Float32Array(obs.length);
@@ -191,7 +212,7 @@
     const r3 = rotate90(r2);
     return {
       id: p.id,
-      url: p.url,
+      url: p.url.trim(),
       numLevels: p.numLevels,
       targets: [
         levelsToTargetVec(r0, map),
@@ -207,7 +228,6 @@
   let opened = false;
   let okStreak = 0;
 
-  // ===== 기본 유틸 =====
   function rgbToGray(r, g, b) {
     return 0.299*r + 0.587*g + 0.114*b;
   }
@@ -223,7 +243,6 @@
     return true;
   }
 
-  // ===== 소벨 =====
   function sobelEdges(gray, w, h) {
     const mag = new Float32Array(w*h);
     const idx = (x,y)=>y*w+x;
@@ -242,7 +261,6 @@
     return mag;
   }
 
-  // ===== quad 추정 =====
   function estimateQuadFromEdges(mag, w, h) {
     const arr = Array.from(mag);
     arr.sort((a,b)=>a-b);
@@ -275,7 +293,6 @@
     return [tl,tr,br,bl];
   }
 
-  // ===== homography =====
   function computeHomography(src, dst) {
     const A = [];
     const b = [];
@@ -379,10 +396,8 @@
     return out;
   }
 
-  // ===== 8x8 추출 =====
   function cellMeanGray(imgData, W, r, c, cell) {
     const { data } = imgData;
-
     const margin = Math.max(1, Math.floor(cell * 0.20));
     const x0 = c * cell + margin;
     const y0 = r * cell + margin;
@@ -396,17 +411,11 @@
         vals.push(rgbToGray(data[idx], data[idx + 1], data[idx + 2]));
       }
     }
-
-    if (vals.length < 10) {
-      let sum = 0;
-      for (const v of vals) sum += v;
-      return vals.length ? sum / vals.length : 0;
-    }
+    if (vals.length === 0) return 0;
 
     vals.sort((a,b)=>a-b);
     const cut = Math.floor(vals.length * 0.10);
     const slice = vals.slice(cut, vals.length - cut);
-
     let sum = 0;
     for (const v of slice) sum += v;
     return sum / slice.length;
@@ -463,19 +472,6 @@
     return Math.sqrt(v) >= 18;
   }
 
-  // ✅ 404 방지용 URL 검증: 이상한 값이면 이동하지 않음
-  function safeNavigate(url) {
-    try {
-      const u = new URL(url);                 // 절대 URL만 허용
-      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("bad protocol");
-      // replace를 쓰면 연속 이동/뒤로가기 문제도 줄어듦
-      window.location.replace(u.href);
-    } catch (e) {
-      console.error("Bad URL:", url, e);
-      setStatus(`이동 실패(잘못된 URL): ${String(url)}`);
-    }
-  }
-
   function scanFrameOnce() {
     if (!captureToDetCanvas()) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
@@ -495,7 +491,7 @@
     const obs = extractGrayVecFromWarp(warped);
     if (!passesContrastGate(obs)) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
-    // ✅ 관측값을 3레벨/4레벨 각각 양자화
+    // ✅ 3레벨/4레벨 관측치 분리
     const obs3 = quantizeObs(obs, 3);
     const obs4 = quantizeObs(obs, 4);
 
@@ -513,15 +509,7 @@
   function loop() {
     if (opened) return;
 
-    let res;
-    try {
-      res = scanFrameOnce();
-    } catch (e) {
-      console.error(e);
-      setStatus("스캔 처리 중 오류(콘솔 확인): " + (e?.message || e));
-      return;
-    }
-
+    const res = scanFrameOnce();
     if (res.ok) okStreak++;
     else okStreak = Math.max(0, okStreak - 1);
 
@@ -531,7 +519,7 @@
       opened = true;
       if (timer) { clearInterval(timer); timer = null; } // ✅ 중복 이동 방지
       setStatus(`인식 성공(${res.bestId})! 이동합니다…`);
-      safeNavigate(res.bestUrl); // ✅ URL 검증 후 이동
+      safeNavigate(res.bestUrl); // ✅ 404 원천 차단
     }
   }
 
@@ -555,8 +543,7 @@
         else video.onloadedmetadata = () => resolve();
       });
 
-      // iOS 일부 환경 안정화
-      try { await video.play(); } catch (e) {}
+      try { await video.play(); } catch(e) {}
 
       setStatus("스캔 시작! (자동으로 사각형을 찾습니다)");
       timer = setInterval(loop, SCAN_INTERVAL_MS);
@@ -570,8 +557,6 @@
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     btnStart.disabled = false;
     btnStop.disabled = true;
-    opened = false;
-    okStreak = 0;
     setStatus("카메라 정지됨.");
   }
 
